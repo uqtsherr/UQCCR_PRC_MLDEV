@@ -239,11 +239,13 @@ ckpt = tf.train.Checkpoint(LSTM_net)
 
 
 latest = tf.train.latest_checkpoint(modelPath)
+print(latest)
 # Restore the model
 load_result = ckpt.restore(latest)
 
 try:
-    load_result.assert_consumed()
+    print(load_result)
+    load_result.assert_existing_objects_matched()
     print('loaded model')
 except:
     print('model not loaded')
