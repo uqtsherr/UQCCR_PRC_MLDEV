@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+
+
+module load gnu7
+module load cuda/11.1.1
+module load anaconda
+module load mvapich2
+module load pmix/2.2.2
+
+source activate timsTF
+
+srun -n1 -c1 --mem=2000 tensorboard --logdir /scratch/medicine/TS-PRC/piglet/logs/ --bind_all

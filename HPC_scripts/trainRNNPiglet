@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+
+#SBATCH -o train_out.txt
+#SBATCH -e train_error.txt
+#SBATCH --partition=gpu
+#SBATCH --mem=50000
+#SBATCH -N 1
+#SBATCH -n 1
+#SBATCH -c 4
+#SBATCH --gres=gpu:tesla-smx2:2
+#SBATCH --job-name=TS_train_Piglet_EEG_Model
+
+module load gnu7
+module load cuda/11.0.2.450
+module load anaconda
+module load mvapich2
+module load pmix/2.2.2
+
+source activate timsTF
+
+srun --mpi=pmi2 --mem=50000 python ~/pycharmFwd/TF1\ work/RNNforPigletEEG.py
