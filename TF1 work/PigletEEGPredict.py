@@ -1,7 +1,9 @@
 from __future__ import division, print_function, absolute_import
 
 
-import tensorflow as tf
+#import tensorflow as tf
+import tensorflow.compat.v1 as tf
+tf.disable_v2_behavior()
 import h5py
 import numpy as np
 #import matplotlib.pyplot as plt
@@ -10,12 +12,11 @@ import time
 
 
 
-fname = 'S:\\UQCCR-Colditz\Signal Processing File Sharing\\For Elliot\\FullFeatureDataset.mat'
+fname = '/scratch/medicine/TS-PRC/mat_file_source/FullFeatureDataset.mat'
 
 print(fname)
 
 
-#note to Elliot, python indexing starts at zero not 1
 num_classes = 5
 with h5py.File(fname, 'r') as file:
     Dataset = file.get('fullList').value
@@ -59,11 +60,10 @@ batch_size = 40000
 dropout = 0.8
 
 n_examples = np.shape(Features)[1]
-training_epochs = 10
+training_epochs = 200
 display_epoch = 1
-logs_path = 'S:\\UQCCR-Colditz\\Signal Processing File Sharing\\For Elliot\\Tensorflow_logs\\example2\\'
-logs_path = 'C:\\Users\\uqeteo1\\tf_logs\\'
-modelPath = 'S:\\UQCCR-Colditz\\Signal Processing File Sharing\\For Elliot\\Tensorflow\\PigletEEG\\model.ckpt'
+logs_path = '/scratch/medicine/TS-PRC/piglet/tf_logs'
+modelPath = '/scratch/medicine/TS-PRC/piglet/model.ckpt'
 
 #Labels = np.expand_dims(Labels, axis=2)
 Features = np.transpose(Features, [1, 0])

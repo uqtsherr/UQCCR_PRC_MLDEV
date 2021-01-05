@@ -1,34 +1,34 @@
 from __future__ import division, print_function, absolute_import
-
-
 import tensorflow as tf
-from tensorflow.contrib import rnn
+from tensorflow.keras import Model, layers
+from tensorflow.keras.mixed_precision import experimental as mixed_precision
+#policy = mixed_precision.Policy('mixed_float16')
+#mixed_precision.set_policy(policy)
 import h5py
 import numpy as np
 #import matplotlib.pyplot as plt
 import os.path
 from os import listdir
 from os.path import isfile, join, isdir, splitext
-import time
-import edflib
+from random import uniform
+import datetime
+import pyedflib
+import openpyxl
+version_maj = 1
+version_min = 2
+print('piglet RNN v%i.%i'% (version_maj,version_min))
 
-foldername = 'C:\\piglet labelled eeg\\'
-folderlist = [join(foldername, f) for f in listdir(foldername) if isdir(join(foldername, f))]
-filelist = []
-for fold in folderlist:
-    fi = [join(fold, f) for f in listdir(fold) if isfile(join(fold, f))]
-    filelist = filelist + fi
-
-print(filelist)
+foldername = '/scratch/medicine/TS-PRC/source_data/'
+fileList = [join(foldername, f) for f in listdir(foldername) if isfile(join(foldername, f))]
 
 fs =256
+channels = 3
 signal_labels = []
 signal_nsamples = []
 Records = []
-for f in filelist:
+for f in fileList:
     a = splitext(f)
     if a[1] == '.mat':
-
         with h5py.File(f) as file:
             print(file['Records'].keys())
             Class = file['Records']['ClassNum'].value
@@ -37,245 +37,301 @@ for f in filelist:
             xEEG = file['Records']['eeg']
             xFeatures = file['Records']['features']
 
-print(foldername)
-print(filelist)
-
-#note to Elliot, python indexing starts at zero not 1
-num_classes = 2
-annotations = []
-i = 0
-if isfile(join(foldername, 'annotations_EEGdata.mat')):
-    with h5py.File(join(foldername, 'annotations_EEGdata.mat')) as file:
-        for c in file['annotat_new']:
-            for r in range(len(c)):
-                annotations.append(file[c[r]][()])
-                i = i + 1
-print(annotations)
-
+catDict = {'Normal': 0, 'Burst': 1, 'Suppression': 2, 'Artifact': 3, 'Seizure': 4}
+num_classes = 5
+if isfile(join(foldername, 'EEG_annotation_recovered.csv.xlsx')):
+    annotationsWB = openpyxl.load_workbook(join(foldername, 'EEG_annotation_recovered.csv.xlsx'), read_only=True)
+print(annotationsWB.sheetnames)
 eegdata = []
-for file in filelist:
+cnts = []
+for file in fileList:
     fpath = join(foldername,file)
     p, ext = os.path.splitext(fpath)
-    if(ext == '.edf'):
+    if(ext == '.EDF'):
         print(fpath + " is a .edf file")
-        edf = edflib.EdfReader(fpath)
-        samples, nSigs = fileinfo(edf)
-        sig1 = np.zeros((samples,nSigs), dtype='int32')
-        buf =  np.zeros(samples, dtype='int32')
-        readsignals(edf,samples,sig1,buf)
-        datName = (sig1,p)
-        eegdata.append(datName)
-        print(sig1)
+        annotation = list(filter(lambda a: a in p, annotationsWB.sheetnames))
+        if annotation!=[]:
+            print("file contains a record :)")
+            edf = pyedflib.EdfReader(fpath)
+            samples = edf.getNSamples()
+            dat = np.zeros([samples[0],channels])
+            for ch in range(channels):
+                dat[:,ch] = edf.readSignal(ch, start=0, n=samples[ch])
+            i = 0
+            print("length in seconds: %f" % (samples[0]/fs))
+            ws = annotationsWB[annotation[0]]  # get sheet for curr rec
+            labels = np.zeros([int(samples[0]/fs),num_classes+1])
+            for row in ws.iter_rows(min_row=4, max_col=2, max_row=int(samples[0]/fs+2),
+                                    values_only=True):
+                labels[i, catDict.get(row[1], 5)] = 1
+                i += 1
+            labels = labels[0:i-9,:]
+            cnts =+ np.sum(labels, 0)
+            print("length annotations: %f" % (i-9))
+            print(labels)
+            eegdata.append((samples,edf,annotation[0],dat,labels))
+            #nSigs = edf.signals_in_file
+            #sig1 = np.zeros((nSigs, edf.getNSamples()[0]))
+            #for i in np.arange(nSigs):
+            #    sig1[i, :edf.getNSamples()[i]] = edf.readSignal(i)
+            #datName = (sig1,p)
+        else:
+            print("edf file was not annotated :(")
     else:
         print(fpath + " is not a .edf file")
+    #break #just grab 1 file - for testing speedup
 
+print(cnts)
+totalSamples = 0;
+for record in eegdata:
+    totalSamples += record[0]
+prob = []
+for record in eegdata:
+    p = record[0]/totalSamples
+    prob.append(p[0])
+records = (eegdata, annotationsWB,totalSamples[0])
+fs = records[0][0][1].getSampleFrequency(0)
+#assumes 1 second classification sectors
+def get_batch(records , prob , n_seconds_per_seq , n_sequences):
+    block = np.zeros([n_sequences,n_seconds_per_seq, channels, 2 * fs])
+    labels = np.zeros([n_sequences,n_seconds_per_seq,num_classes+1])
+    for k in range(n_sequences):
+        p = uniform(0, 1)
+        currRec = []
+        # find which record we are using
+        for i in range(len(prob)):
+            p -= prob[i]
+            if(p<0):
+                curr_rec = records[0][i]
+                break
+        start = int(uniform(0,(curr_rec[4].shape[0]-n_seconds_per_seq * n_sequences)*fs)) #randomly pick a start point across the record that will not over/underrun
+        tmp = np.zeros([1,(n_seconds_per_seq+1)*fs])
+        for c in range(channels):
+            #tmp = curr_rec[1].readSignal(c, start=start, n=(n_seconds_per_seq+1)*fs)
+            tmp = curr_rec[3][start:start+(n_seconds_per_seq+1)*fs,c]
+            for i in range(n_seconds_per_seq):
+                block[k,i,c,:] = tmp[fs*i:fs*(i+2)]
+        offset = int(start/fs)
 
-records, validation = getLeaveOneOut(annotations, eegdata, 0);
+        #ws = records[1][curr_rec[2]] #get sheet for curr rec
+        #catDict = {'Normal':0,'Burst':1,'Suppression':2,'Artifact':3,'Seizure':4}
+        #i = 0
+        #for row in ws.iter_rows(min_row=offset+1, max_col=2, max_row=offset+n_seconds_per_seq, values_only=True):
+        #    labels[k,i,catDict.get(row[1], -1)] =  1
+        #    i += 1
+        labels[k,:,:] = curr_rec[4][offset:offset+n_seconds_per_seq,:]
+    return block, labels
 
+def get_dataset(records , n_seconds_per_seq):
+    n_seq = 0
+    for c in records[0]:
+        n_seq +=  int(c[4].shape[0]/n_seconds_per_seq)-1
+    block = np.zeros([n_seq, n_seconds_per_seq, channels, 2 * fs])
+    labels = np.zeros([n_seq, n_seconds_per_seq, num_classes+1])
+    #print(np.shape(block))
+    #print(np.shape(labels))
+    seq_start = 0 #tracks start of sequences between records
+    for curr_rec in records[0]:
+        #print(seq_start)
+        n_sequences = int(curr_rec[4].shape[0]/n_seconds_per_seq)-1
+        #n_sequences = int(curr_rec[1].getNSamples()[0]/fs/n_seconds_per_seq)-1
+        #block = np.zeros([n_sequences,n_seconds_per_seq, channels, 2 * fs])
+        #labels = np.zeros([n_sequences,n_seconds_per_seq,5])
+        seq_offset = int(uniform(0,n_seconds_per_seq)) #randomly start the sequence within the sequence gap range
+        for k in range(n_sequences):
+            start = int(uniform(0,256)+fs*(k*n_seconds_per_seq+seq_offset)) #randomly wiggle the start point of a sequence across 1second
+            tmp = np.zeros([1,(n_seconds_per_seq+1)*fs])
+            for c in tf.range(channels):
+                #tmp = curr_rec[1].readSignal(c, start=start, n=(n_seconds_per_seq+1)*fs)
+                tmp = curr_rec[3][start:start+(n_seconds_per_seq+2)*fs,c]
+                for i in range(n_seconds_per_seq):
+                    block[k+seq_start,i,c,:] = tmp[fs*i:fs*(i+2)]
+            offset = int(start/fs)
+            labels[k+seq_start,:,:] = curr_rec[4][offset:offset+n_seconds_per_seq,:]
+        seq_start += n_sequences
 
+    return block, labels
 
-##End data load section - records is a tuple of labels,Dataset
+##End data load section - records is a tuple of edfFiles,sheet string
 #Data is currently imported as a record, where records are made up of a (label data) tuple. label file of N x 3 samples where N is record length in seconds
 #The a data is matrix of 21x (NxFs) where fs is 256Hz
 
 # Training Parameters
-learning_rate = 0.001
-batch_size = 40000
-dropout = 0.8
+learning_rate = 0.00002
+training_epochs = 150
+batch_size = 10
+sequence_length = 75
+save_epoch = 3
 
-n_recs = np.shape(records)[0]
-print(n_recs)
-training_epochs = 3
-display_epoch = 1
-num_hidden = 40
-timesteps = 256
-channels = 21
+train_CNN = True
+dropout = 0.25
+LSTM_output_units = 200
+LSTM_input_units = 200
+
+#print('testing load times')
+#bl, lb = get_batch(records,prob,sequence_length,batch_size)
+#print(np.shape(bl))
+#print(np.shape(lb))
 
 #dfefine logging paths
-logs_path = 'S:\\UQCCR-Colditz\\Signal Processing File Sharing\\For Elliot\\Tensorflow_logs\\example2\\'
-modelPath = 'S:\\UQCCR-Colditz\\Signal Processing File Sharing\\For Elliot\\Tensorflow\\PigletEEG\\model.ckpt'
-
-
-logs_path = 'C:\\TF\\tf_logs\\'
-modelPath = 'C:\\TF\\Models\\RNNforEEG\\'
-
-# Create the neural network
-def dense_net(x_dict, n_classes, dropout, reuse, is_training):
-    # Define a scope for reusing the variables
-    with tf.variable_scope('ConvNet', reuse=reuse):
-        # TF Estimator input is a dict, in case of multiple inputs
-        print('network layers Features')
-        Feats = x_dict['xFeats']
-        Feats = tf.transpose(Feats, perm=[0,2,1])
-        channs = tf.unstack(Feats, 2)
-        stfts = tf.signal.stft(channs,64,8,64)
-        stfts = tf.cast(stfts, tf.complex64)
-        tmplayer = tf.layers.conv2d(stfts, 32, 10, activation=tf.nn.relu,data_format='channels_last')
-        print(np.shape(tmplayer))
-        tmplayer = tf.layers.conv2d(tmplayer, 32, 10, activation=tf.nn.relu)
-        print(np.shape(tmplayer))
-        tmplayer = tf.reshape(tmplayer, [-1,3*32])
-        # Output layer, class prediction
-        fcl = tf.layers.dense(tmplayer, 500)
-        fcl = tf.layers.dense(fcl, 200)
-        fcl = tf.layers.dense(fcl, 100)
-        fcl = tf.layers.dense(fcl, 40)
-        tf.nn.dropout(fcl, keep_prob=dropout)
-        out = tf.layers.dense(fcl, 2) #for the 5 classes present in the dataset
-
-        return out
-
-def BiRNN(x_dict, weights, biases):
-
-        # Prepare data shape to match `rnn` function requirements
-        # Current data input shape: (batch_size, timesteps, n_input)
-        # Required shape: 'timesteps' tensors list of shape (batch_size, num_input)
-        x = x_dict['xFeats']
-        # Unstack to get a list of 'timesteps' tensors of shape (batch_size, num_input)
-        x = tf.reshape(x, [-1,timesteps*channels])
-        x = tf.unstack(x, timesteps*channels, 1)        #this is the major hurdle. rearranging the input data to match the intended input space.
-
-        # Define lstm cells with tensorflow
-        # Forward direction cell
-        lstm_fw_cell = rnn.BasicLSTMCell(num_hidden, forget_bias=1.0)
-        # Backward direction cell
-        lstm_bw_cell = rnn.BasicLSTMCell(num_hidden, forget_bias=1.0)
-
-        outputs, _, _ = rnn.static_bidirectional_rnn(lstm_fw_cell, lstm_bw_cell, x,
-                                                     dtype=tf.float32)
-        # Get lstm cell output
-        try:
-            outputs, _, _ = rnn.static_bidirectional_rnn(lstm_fw_cell, lstm_bw_cell, x,
-                                                         dtype=tf.float32)
-        except Exception:  # Old TensorFlow version only returns outputs not states
-            outputs = rnn.static_bidirectional_rnn(lstm_fw_cell, lstm_bw_cell, x,
-                                                   dtype=tf.float32)
-
-        # Linear activation, using rnn inner loop last output
-        return tf.matmul(outputs[-1], weights['out']) + biases['out']
-print(np.shape(records[0][0]) )
-# generate placeholder variables to initiate the network model and training functions the features placeholder is n by features length (dim 2)
-xFeats = tf.placeholder(tf.float32, [None, np.shape(records[0][0])[1], np.shape(records[0][0])[2]], name='InputData')
-
-# the labels placeholder is n by 1
-y = tf.placeholder(tf.float32, [None, 2], name='LabelData')
-
-# Define weights
-weights = {
-    # Hidden layer weights => 2*n_hidden because of forward + backward cells
-    'out': tf.Variable(tf.random_normal([2*num_hidden, num_classes]))
-}
-biases = {
-    'out': tf.Variable(tf.random_normal([num_classes]))
-}
-
-# Construct model and encapsulating all ops into scopes, making
-# Tensorboard's Graph visualization more convenient
-with tf.name_scope('Model'):
-    # Model
-    dat = {'xFeats': xFeats}
-    # logits = BiRNN(dat, weights, biases)
-    logits = dense_net(dat, num_classes, dropout, reuse=False, is_training=True)
-    prediction = tf.nn.softmax(logits)
-with tf.name_scope('Loss'):
-    # Minimize error using cross entropy
-    #loss = tf.reduce_mean(tf.pow(logits - y, 2))
-    print(prediction)
-    weightedLoss = tf.nn.softmax_cross_entropy_with_logits(
-        logits=logits, labels=y)
-    loss = tf.reduce_mean(weightedLoss)
-with tf.name_scope('SGD'):
-    # Gradient Descent
-    optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate)
-    #optimizer = tf.train.GradientDescentOptimizer(learning_rate=learning_rate)
-    # Op to calculate every variable gradient
-    grads = tf.gradients(loss, tf.trainable_variables())
-    grads = list(zip(grads, tf.trainable_variables()))
-    # Op to update all variables according to their gradient
-    apply_grads = optimizer.apply_gradients(grads_and_vars=grads)
-
-with tf.name_scope('Accuracy'):
-    # Accuracy
-    acc,acc_op = tf.metrics.accuracy(labels=y, predictions=prediction)
-# Initialize the variables (i.e. assign their default value)
-init = tf.global_variables_initializer()
-
-# Create a summary to monitor cost tensor
-tf.summary.scalar("loss", loss)
-# Create a summary to monitor accuracy tensor
-tf.summary.scalar("accuracy", tf.squeeze(acc))
-# Merge all summaries into a single op
-merged_summary_op = tf.summary.merge_all()
-saver = tf.train.Saver()
-modelAvailFlag = os.path.isfile(modelPath + '.index')
-# Start training
-
-with tf.Session() as sess:
-    # Run the initializer
-    sess.run(init)
-    sess.run(tf.local_variables_initializer())
-    # Load the model if it exists
-    print('attempting to load model')
-    if modelAvailFlag:
-        #try restore model
-        try:
-            saver.restore(sess, modelPath)
-            print("Model restored.")
-        except:
-            print("model is broken, likely the network structure has changed. will overwrite old model")
-    else:
-        print("model file not present, intialising a new model")
-
-    # op to write logs to Tensorboard
-    summary_writer = tf.summary.FileWriter(logs_path, graph=tf.get_default_graph())
-
-    tlast = time.time()
-    # Training cycle
-    print('starting training')
-    for epoch in range(training_epochs):
-        avg_cost = 0.
-        #print('new epoch')
-        # Loop over all batches
-        i = 0;
-        for rec in records:
-            i = i+1;
-            #print('batch ', i)
-            batch_xs = rec[0]
-            batch_ys = rec[1][:, 1]
-            batch_ys = tf.one_hot(batch_ys,2).eval()  #get one hot tensor and return to a numpy vector
-            #print('size of batch , labels', np.shape(batch_xs), np.shape(batch_ys))
+logs_path = '/scratch/medicine/TS-PRC/piglet/logs/v%i.%i/'%(version_maj,version_min)
+modelPath = '/scratch/medicine/TS-PRC/piglet/v%i.%i/checkpoint/model.ckpt'%(version_maj,version_min)
+print('saving to:'+ modelPath)
+current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+train_summary_writer = tf.summary.create_file_writer(logs_path + current_time + '/train')
+test_summary_writer = tf.summary.create_file_writer(logs_path + current_time + '/test')
 
 
 
-            # Run optimization op (backprop), cost op (to get loss value)
-            # and summary nodes
-            _, c, summary = sess.run([apply_grads, loss, merged_summary_op], feed_dict={xFeats: batch_xs, y: batch_ys})
-            #print('batch trained in ', time.time()-tlast, ' seconds, writing to log')
-            tlast = time.time()
-            # Write logs at every iteration
-            summary_writer.add_summary(summary, epoch * n_recs + i)
-            # Compute average loss
-            print(c)
-            avg_cost += c / n_recs
-        # Display logs per epoch step
-        if (epoch+1) % display_epoch == 0:
-            xF = []
-            yF = []
-            accin = sess.run(acc_op, feed_dict={xFeats: batch_xs, y: batch_ys})
-            accout = sess.run(acc_op, feed_dict={xFeats: validation[0], y: tf.one_hot(validation[1][:, 1], 2).eval()})
-            print("Epoch:", '%04d' % (epoch+1), "cost=", "{:.9f}".format(avg_cost), " internal accuracy; validation accuracy", accin, accout)
-        spath = saver.save(sess, modelPath)
-        print('model saved at location:  %s' % spath)
-    print("Optimization Finished!")
 
-    # Test model
-    # Calculate accuracy
-    acc = sess.run(acc_op, feed_dict={xFeats: validation[0], y: tf.one_hot(validation[1][:, 1], 2).eval()})
-    pred = sess.run(prediction, feed_dict={xFeats: validation[0], y: tf.one_hot(validation[1][:, 1], 2).eval()})
-    print("Accuracy:", acc)
-    print(pred)
-    np.savetxt("foo.csv", pred, delimiter=",")
+class LSTM(Model):
+    # Set layers.
+    def __init__(self):
+        super(LSTM, self).__init__()
+        # Define a Masking Layer with -1 as mask.
+        self.norm = x = layers.BatchNormalization()
+        self.CNN = tf.keras.applications.EfficientNetB0(
+            include_top=False, weights='imagenet', input_tensor=None,
+            input_shape=None, pooling=None, classes=1000)
+        self.CNN.trainable = train_CNN
+        self.dense = layers.Dense(LSTM_input_units)
+        # Define a LSTM layer to be applied over the Masking layer.
+        # Dynamic computation will automatically be performed to ignore -1 values.
+        self.lstm = layers.Bidirectional(layers.GRU(units=LSTM_output_units, return_sequences=True,dropout=dropout))
+        # Output fully connected layer (5 classes).
+        self.out = layers.Dense(num_classes+1)
 
-    print("Run the command line:\n" \
-          "--> tensorboard --logdir=C:\\Users\\Tim\\PycharmProjects\\TensorFlow-Examples\\tensorflow_logs\\example\\ " \
-          "\nThen open http://0.0.0.0:6006/ into your web browser")
+
+    # Set forward pass.
+    #input dims:[batch_size, seq_len, channels, window]
+    def call(self, x, is_training=False):
+        #turn EEG from temporal signals to spectrogram imgs
+        x = tf.signal.stft(x,128,4,window_fn=tf.signal.hann_window)
+        #x = tf.math.log(x)
+        x = self.norm(x)
+        x = tf.transpose(x,perm=[0,1,3,4,2])
+        x = tf.reshape(x, shape=[-1,97,65,3])
+        x = self.CNN(x)
+        x = tf.reshape(x, shape=[-1,3*2*1280])
+        x = self.dense(x)
+        # A RNN Layer expects a 3-dim input (batch_size, seq_len, num_features).
+        x = tf.reshape(x, shape=[-1, sequence_length, LSTM_input_units])
+        # No Masking layer as I have set seq length.
+        # Apply LSTM layer.
+        x = self.lstm(x)
+        # Apply output layer.
+        x = self.out(x)
+        if not is_training:
+            # tf cross entropy expect logits without softmax, so only
+            # apply softmax when not training.
+            x = tf.nn.softmax(x)
+        return x
+
+LSTM_net = LSTM()
+LSTM_net.build([batch_size,sequence_length,channels,fs*2])
+LSTM_net.summary()
+
+
+
+# Create a callback that saves the model's weights
+ckpt = tf.train.Checkpoint(LSTM_net)
+
+
+
+latest = tf.train.latest_checkpoint(modelPath)
+# Restore the model
+load_result = ckpt.restore(latest)
+
+try:
+    load_result.assert_consumed()
+    print('loaded model')
+except:
+    print('model not loaded')
+
+# Cross-Entropy Loss.
+# Note that this will apply 'softmax' to the logits.
+def cross_entropy_loss(x, y):
+    # Convert labels to int 64 for tf cross-entropy function.
+    y = tf.cast(y, tf.int64)
+    # Apply softmax to logits and compute cross-entropy.
+    loss = tf.nn.softmax_cross_entropy_with_logits(labels=y, logits=x) #sparse_softmax_cross_entropy_with_logits
+    # Average loss across the batch.
+    return tf.reduce_mean(loss)
+
+# Accuracy metric.
+def accuracy(y_pred, y_true):
+    # Predicted class is the index of highest score in prediction vector (i.e. argmax).
+    correct_prediction = tf.equal(tf.argmax(y_true, 2), tf.argmax(y_pred, 2))
+    #print(correct_prediction)
+    return tf.reduce_mean(tf.reduce_mean(tf.cast(correct_prediction, tf.float32), axis=-1))
+
+# Adam optimizer.
+optimizer = tf.optimizers.Adam(learning_rate)
+
+
+# Optimization process.
+def run_optimization(x, y):
+    # Wrap computation inside a GradientTape for automatic differentiation.
+    with tf.GradientTape() as g:
+        # Forward pass.
+        pred = LSTM_net(x, is_training=True)
+        # Compute loss.
+        loss = cross_entropy_loss(pred, y)
+
+    # Variables to update, i.e. trainable variables.
+    trainable_variables = LSTM_net.trainable_variables
+
+    # Compute gradients.
+    gradients = g.gradient(loss, trainable_variables)
+
+    # Update weights following gradients.
+    optimizer.apply_gradients(zip(gradients, trainable_variables))
+    acc = accuracy(pred, y)
+    return loss, acc
+
+
+# Run training for the given number of steps.
+for step in range(training_epochs):
+    SHUFFLE_BUFFER_SIZE = 5000
+    N_test = 300
+    x, y = get_dataset(records, sequence_length)
+    dataset = tf.data.Dataset.from_tensor_slices((x, y))
+    dataset = dataset.shuffle(SHUFFLE_BUFFER_SIZE).batch(batch_size)
+    test_dataset = dataset.take(N_test)
+    train_dataset = dataset.skip(N_test)
+    batch = 0
+    train_loss = tf.convert_to_tensor(0.0)
+    train_acc = tf.convert_to_tensor(0.0)
+    for batch_x, batch_y in train_dataset:
+        # Run the optimization to update W and b values.
+        #batch_x, batch_y = get_batch(records, prob, sequence_length, batch_size)
+        l, a = run_optimization(batch_x, batch_y)
+        train_acc = train_acc + a
+        train_loss = train_loss + l
+        batch +=1
+        if batch % 50 == 0:
+            print("batch: %i, running average loss: %f, running average accuracy: %f" % (batch, train_loss/batch, train_acc/batch))
+
+    with train_summary_writer.as_default():
+        tf.summary.scalar('loss', train_loss/batch, step=step)
+        tf.summary.scalar('accuracy', train_acc/batch, step=step)
+    loss = tf.convert_to_tensor(0.0)
+    acc = tf.convert_to_tensor(0.0)
+    for test_x, test_y in test_dataset:
+    #test_x, test_y = get_batch(records, prob, sequence_length, batch_size)
+        pred = LSTM_net(test_x, is_training=True)
+        loss = cross_entropy_loss(pred, test_y) + loss
+        acc = accuracy(pred, test_y) + acc
+    acc = acc / N_test
+    loss = loss / N_test
+    print("epoch: %i, test av loss: %f, av accuracy: %f" % (step, loss, acc))
+    with test_summary_writer.as_default():
+        tf.summary.scalar('loss', loss, step=step)
+        tf.summary.scalar('accuracy', acc, step=step)
+
+    if step % save_epoch == 0 & step != 0:
+        save_path = ckpt.save(modelPath)
+        print('saved model')
+
+
+records[1].close() #close the xl sheet
