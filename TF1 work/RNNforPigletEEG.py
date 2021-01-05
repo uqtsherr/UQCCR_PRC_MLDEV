@@ -11,11 +11,12 @@ import os.path
 from os import listdir
 from os.path import isfile, join, isdir, splitext
 from random import uniform
+from pathlib import Path
 import datetime
 import pyedflib
 import openpyxl
 version_maj = 1
-version_min = 2
+version_min = 3
 print('piglet RNN v%i.%i'% (version_maj,version_min))
 
 foldername = '/scratch/medicine/TS-PRC/source_data/'
@@ -157,16 +158,19 @@ def get_dataset(records , n_seconds_per_seq):
 #The a data is matrix of 21x (NxFs) where fs is 256Hz
 
 # Training Parameters
-learning_rate = 0.00002
-training_epochs = 150
+learning_rate = 0.00004
+training_epochs = 300
 batch_size = 10
 sequence_length = 75
-save_epoch = 3
+save_epoch = 5
 
 train_CNN = True
 dropout = 0.25
-LSTM_output_units = 200
 LSTM_input_units = 200
+LSTM1_output_units = 100
+LSTM2_output_units = 100
+LSTM3_output_units = 100
+
 
 #print('testing load times')
 #bl, lb = get_batch(records,prob,sequence_length,batch_size)
@@ -175,8 +179,14 @@ LSTM_input_units = 200
 
 #dfefine logging paths
 logs_path = '/scratch/medicine/TS-PRC/piglet/logs/v%i.%i/'%(version_maj,version_min)
-modelPath = '/scratch/medicine/TS-PRC/piglet/v%i.%i/checkpoint/model.ckpt'%(version_maj,version_min)
-print('saving to:'+ modelPath)
+modelPath = '/scratch/medicine/TS-PRC/piglet/v%i.%i/ckpt'%(version_maj,version_min)
+(m_path,t) = os.path.split(modelPath)
+if not os.path.exists(m_path):
+    print("no prior folder exists at %s - starting from scratch"% m_path)
+else:
+    print('saving to:' + modelPath)
+Path(m_path).mkdir(parents=True, exist_ok=True)
+
 current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 train_summary_writer = tf.summary.create_file_writer(logs_path + current_time + '/train')
 test_summary_writer = tf.summary.create_file_writer(logs_path + current_time + '/test')
@@ -192,12 +202,14 @@ class LSTM(Model):
         self.norm = x = layers.BatchNormalization()
         self.CNN = tf.keras.applications.EfficientNetB0(
             include_top=False, weights='imagenet', input_tensor=None,
-            input_shape=None, pooling=None, classes=1000)
+            input_shape=None, pooling=None)
         self.CNN.trainable = train_CNN
         self.dense = layers.Dense(LSTM_input_units)
         # Define a LSTM layer to be applied over the Masking layer.
         # Dynamic computation will automatically be performed to ignore -1 values.
-        self.lstm = layers.Bidirectional(layers.GRU(units=LSTM_output_units, return_sequences=True,dropout=dropout))
+        self.lstm1 = layers.Bidirectional(layers.GRU(units=LSTM1_output_units, return_sequences=True,dropout=dropout))
+        self.lstm2 = layers.Bidirectional(layers.GRU(units=LSTM2_output_units, return_sequences=True,dropout=dropout))
+        self.lstm3 = layers.Bidirectional(layers.GRU(units=LSTM3_output_units, return_sequences=True,dropout=dropout))
         # Output fully connected layer (5 classes).
         self.out = layers.Dense(num_classes+1)
 
@@ -218,7 +230,11 @@ class LSTM(Model):
         x = tf.reshape(x, shape=[-1, sequence_length, LSTM_input_units])
         # No Masking layer as I have set seq length.
         # Apply LSTM layer.
-        x = self.lstm(x)
+        x_hat = self.lstm1(x)
+        x_hat = tf.concat([x, x_hat],2) #the fwd pass
+        x_hat = self.lstm2(x_hat)
+        x_hat = tf.concat([x, x_hat], 2)
+        x = self.lstm3(x_hat)
         # Apply output layer.
         x = self.out(x)
         if not is_training:
@@ -232,20 +248,23 @@ LSTM_net.build([batch_size,sequence_length,channels,fs*2])
 LSTM_net.summary()
 
 
+# Adam optimizer.
+optimizer = tf.optimizers.Adam(learning_rate)
+
 
 # Create a callback that saves the model's weights
-ckpt = tf.train.Checkpoint(LSTM_net)
+ckpt = tf.train.Checkpoint(LSTM_net=LSTM_net,optimizer=optimizer)
 
 
-
-latest = tf.train.latest_checkpoint(modelPath)
-print(latest)
+(p,t) =os.path.split(modelPath)
+latest = tf.train.latest_checkpoint(p)
+print('restoring checkpoint from folder %s' % latest)
 # Restore the model
 load_result = ckpt.restore(latest)
 
 try:
     print(load_result)
-    load_result.assert_existing_objects_matched()
+    load_result.assert_consumed()
     print('loaded model')
 except:
     print('model not loaded')
@@ -267,8 +286,6 @@ def accuracy(y_pred, y_true):
     #print(correct_prediction)
     return tf.reduce_mean(tf.reduce_mean(tf.cast(correct_prediction, tf.float32), axis=-1))
 
-# Adam optimizer.
-optimizer = tf.optimizers.Adam(learning_rate)
 
 
 # Optimization process.
@@ -295,7 +312,7 @@ def run_optimization(x, y):
 # Run training for the given number of steps.
 for step in range(training_epochs):
     SHUFFLE_BUFFER_SIZE = 5000
-    N_test = 300
+    N_test = 100
     x, y = get_dataset(records, sequence_length)
     dataset = tf.data.Dataset.from_tensor_slices((x, y))
     dataset = dataset.shuffle(SHUFFLE_BUFFER_SIZE).batch(batch_size)
@@ -331,7 +348,7 @@ for step in range(training_epochs):
         tf.summary.scalar('loss', loss, step=step)
         tf.summary.scalar('accuracy', acc, step=step)
 
-    if step % save_epoch == 0 & step != 0:
+    if step % save_epoch == 0:
         save_path = ckpt.save(modelPath)
         print('saved model')
 
