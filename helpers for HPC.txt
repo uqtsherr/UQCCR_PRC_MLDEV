@@ -1,5 +1,5 @@
+port forward from a remote node to the local PC - could be used to fwd data from a server directly to pycharm
 ssh -L 8080:gpunode-x-xx:22 uqtsherr@wiener.hpc.dc.uq.edu.au
-
 
 to run tensorboard on a node:
 sh tensorboard_run
