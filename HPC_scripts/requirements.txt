@@ -1,5 +1,5 @@
 h5py
 Markdown
-tensorflow==2.4.0
+tensorflow==2.5.3
 pyedflib
 openpyxl
